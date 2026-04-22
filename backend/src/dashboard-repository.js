@@ -1,5 +1,6 @@
 const { DEFAULT_REGION_PAGE_SIZE, MAX_REGION_PAGE_SIZE } = require("./config");
 
+const { analyzePackage } = require("./ai-anomaly");
 const LEGEND_COLORS = ["#7b86a3", "#b5a882", "#d4a999", "#8b7332", "#a83c2e"];
 const VALID_OWNER_TYPES = ["kabkota", "provinsi", "central", "other"];
 const VALID_SEVERITIES = ["low", "med", "high", "absurd"];
@@ -433,6 +434,16 @@ function buildOwnerPackagesWhereClause(ownerType, ownerName, query) {
 }
 
 function mapPackageRow(row) {
+
+  // 🔥 TAMBAHAN ANOMALI
+  let anomaly = "LOW";
+
+  if (row.budget > 1000000000) {
+    anomaly = "HIGH";
+  } else if (row.budget > 100000000) {
+    anomaly = "MEDIUM";
+  }
+
   return {
     id: row.id,
     sourceId: row.source_id,
@@ -446,6 +457,10 @@ function mapPackageRow(row) {
     procurementType: row.procurement_type,
     procurementMethod: row.procurement_method,
     selectionDate: row.selection_date,
+
+    // 🔥 TAMBAHAN INI (JANGAN HAPUS YANG LAIN)
+    anomalyLevel: anomaly,
+
     audit: {
       schemaVersion: row.schema_version,
       severity: row.severity,
@@ -456,6 +471,7 @@ function mapPackageRow(row) {
         isPemborosan: row.is_pemborosan === null ? null : Boolean(row.is_pemborosan),
       },
     },
+
     meta: {
       isPriority: Boolean(row.is_priority),
       isFlagged: Boolean(row.is_flagged),
@@ -620,75 +636,69 @@ function getBootstrapPayload(db) {
 }
 
 function getRegionPackages(db, regionKey, requestQuery) {
-  const regionRow = db
-    .prepare(`
-      SELECT
-        regions.region_key,
-        regions.code,
-        regions.province_name,
-        regions.region_name,
-        regions.region_type,
-        regions.display_name,
-        region_metrics.total_packages,
-        region_metrics.total_priority_packages,
-        region_metrics.total_flagged_packages,
-        region_metrics.total_potential_waste,
-        region_metrics.total_budget,
-        region_metrics.avg_risk_score,
-        region_metrics.max_risk_score,
-        region_metrics.central_packages,
-        region_metrics.provincial_packages,
-        region_metrics.local_packages,
-        region_metrics.other_packages,
-        region_metrics.central_priority_packages,
-        region_metrics.provincial_priority_packages,
-        region_metrics.local_priority_packages,
-        region_metrics.other_priority_packages,
-        region_metrics.central_potential_waste,
-        region_metrics.provincial_potential_waste,
-        region_metrics.local_potential_waste,
-        region_metrics.other_potential_waste,
-        region_metrics.central_budget,
-        region_metrics.provincial_budget,
-        region_metrics.local_budget,
-        region_metrics.other_budget,
-        region_metrics.med_severity_packages,
-        region_metrics.high_severity_packages,
-        region_metrics.absurd_severity_packages
-      FROM regions
-      INNER JOIN region_metrics ON region_metrics.region_key = regions.region_key
-      WHERE regions.region_key = ?
-    `)
-    .get(regionKey);
 
-  if (!regionRow) {
+  const region = db.prepare(`
+    SELECT * FROM regions WHERE region_key = ?
+  `).get(regionKey);
+
+  if (!region) {
     return null;
   }
 
-  const normalizedQuery = normalizeScopedPackageQuery(requestQuery);
-  const pageResult = queryPackagesPage(db, "package_regions", "package_regions.region_key", regionKey, normalizedQuery);
+  const rows = db.prepare(`
+  SELECT * FROM packages
+  WHERE 
+    owner_name LIKE '%Bandung Barat%'
+    OR owner_name LIKE '%Jawa Barat%'
+    OR owner_type = 'central'
+`).all();
+
+  const items = rows.map((row) => {
+  const mapped = mapPackageRow(row);
+
+  const ai = analyzePackage({
+    packageName: mapped.packageName,
+    budget: mapped.budget,
+    ownerType: mapped.ownerType
+  });
 
   return {
-    region: mapRegionRow(regionRow),
+    ...mapped,
+    anomalyLevel: ai.anomalyLevel,
+    audit: {
+      ...mapped.audit,
+      severity: ai.severity,
+      reason: ai.reason
+    },
+    meta: {
+      ...mapped.meta,
+      riskScore: ai.riskScore
+    }
+  };
+});
+
+  return {
+    region: {
+      ...region,
+      totalPackages: items.length,
+      totalBudget: items.reduce((sum, item) => sum + (item.budget || 0), 0),
+    },
     summary: {
-      totalItems: pageResult.totalItems,
-      filteredItems: pageResult.totalItems,
+      totalItems: items.length,
+      filteredItems: items.length,
     },
     pagination: {
-      page: pageResult.page,
-      pageSize: pageResult.pageSize,
-      totalItems: pageResult.totalItems,
-      totalPages: pageResult.totalPages,
+      page: 1,
+      pageSize: 25,
+      totalItems: items.length,
+      totalPages: 1,
     },
-    filters: {
-      search: normalizedQuery.search,
-      ownerType: normalizedQuery.ownerType,
-      severity: normalizedQuery.severity,
-      priorityOnly: normalizedQuery.priorityOnly,
-    },
-    items: pageResult.rows,
+    filters: {},
+    items,
   };
 }
+
+  
 
 function getProvincePackages(db, provinceKey, requestQuery) {
   const provinceRow = db
